@@ -54,7 +54,6 @@ char * mintty_debug;
 #define GWL_USERDATA -21
 #endif
 
-
 char * home;
 char * cmd;
 bool icon_is_from_shortcut = false;
@@ -193,7 +192,6 @@ static HRESULT (WINAPI * pSetWindowCompositionAttribute)(HWND, void *) = 0;
 static BOOL (WINAPI * pSystemParametersInfo)(UINT, UINT, PVOID, UINT) = 0;
 
 static BOOLEAN (WINAPI * pShouldAppsUseDarkMode)(void) = 0; /* undocumented */
-static DWORD (WINAPI * pSetPreferredAppMode)(DWORD) = 0; /* undocumented */
 static HRESULT (WINAPI * pSetWindowTheme)(HWND, const wchar_t *, const wchar_t *) = 0;
 
 #define HTHEME HANDLE
@@ -241,20 +239,10 @@ load_dwm_funcs(void)
       (void *)GetProcAddress(user32, "SystemParametersInfoW");
   }
   if (uxtheme) {
-    DWORD win_version = GetVersion();
-    uint build = HIWORD(win_version);
-    win_version = ((win_version & 0xff) << 8) | ((win_version >> 8) & 0xff);
-    //printf("Windows %d.%d Build %d\n", win_version >> 8, win_version & 0xFF, build);
-    if (win_version > 0x0601 && build >= 17763) { // minimum version 1809
-      pShouldAppsUseDarkMode = 
-        (void *)GetProcAddress(uxtheme, MAKEINTRESOURCEA(132)); /* ordinal */
-      pSetPreferredAppMode = 
-        (void *)GetProcAddress(uxtheme, MAKEINTRESOURCEA(135)); /* ordinal */
-        // this would be AllowDarkModeForApp before Windows build 18362
-    }
+    pShouldAppsUseDarkMode = 
+      (void *)GetProcAddress(uxtheme, MAKEINTRESOURCEA(132)); /* ordinal */
     pSetWindowTheme = 
       (void *)GetProcAddress(uxtheme, "SetWindowTheme");
-
     pOpenThemeData =
       (void *)GetProcAddress(uxtheme, "OpenThemeData");
     pCloseThemeData =
@@ -1423,11 +1411,8 @@ bool
 win_is_glass_available(void)
 {
   BOOL result = false;
-#ifdef support_glass
-#warning #501: “Just give up on glass effects. Microsoft clearly have.”
   if (pDwmIsCompositionEnabled)
     pDwmIsCompositionEnabled(&result);
-#endif
   return result;
 }
 
@@ -1466,11 +1451,28 @@ win_update_blur(bool opaque)
 static void
 win_update_glass(bool opaque)
 {
-  bool enabled =
-    cfg.transparency == TR_GLASS && !win_is_fullscreen &&
-    !(opaque && term.has_focus);
+  bool enabled;
 
-  if (pDwmExtendFrameIntoClientArea) {
+	enum WindowCompositionAttribute
+  {
+    WCA_ACCENT_POLICY = 19,
+		WCA_USEDARKMODECOLORS = 26
+  };
+	enum WindowCompositionAttribute accentType = WCA_ACCENT_POLICY;
+  if (cfg.transparency != TR_GLASS) {
+		  static wstring personalizekeyname = W("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+			uint useLight = getregval(HKEY_CURRENT_USER, personalizekeyname, W("AppsUseLightTheme"));
+			if (0 == useLight) {
+				enabled = true;
+				accentType = WCA_USEDARKMODECOLORS;
+			} else {
+				enabled = false;
+			}
+	} else {
+		enabled = cfg.transparency == TR_GLASS && !win_is_fullscreen && !(opaque && term.has_focus);
+	}
+  
+	if (pDwmExtendFrameIntoClientArea) {
     pDwmExtendFrameIntoClientArea(wnd, &(MARGINS){enabled ? -1 : 0, 0, 0, 0});
   }
 
@@ -1484,10 +1486,6 @@ win_update_glass(bool opaque)
       ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
       ACCENT_ENABLE_HOSTBACKDROP = 5,
       ACCENT_INVALID_STATE = 6
-    };
-    enum WindowCompositionAttribute
-    {
-      WCA_ACCENT_POLICY = 19
     };
     struct ACCENTPOLICY
     {
@@ -1511,35 +1509,13 @@ win_update_glass(bool opaque)
       0
     };
     struct WINCOMPATTRDATA data = {
-      WCA_ACCENT_POLICY,
+      accentType,
       (PVOID)&policy,
       sizeof(policy)
     };
 
     //printf("SetWindowCompositionAttribute %d\n", policy.nAccentState);
     pSetWindowCompositionAttribute(wnd, &data);
-  }
-}
-
-void
-win_dark_mode(HWND w)
-{
-  if (pShouldAppsUseDarkMode) {
-    HIGHCONTRASTW hc;
-    hc.cbSize = sizeof hc;
-    pSystemParametersInfo(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0);
-    //printf("High Contrast scheme <%ls>\n", hc.lpszDefaultScheme);
-
-    if (!(hc.dwFlags & HCF_HIGHCONTRASTON) && pShouldAppsUseDarkMode()) {
-      pSetWindowTheme(w, W("DarkMode_Explorer"), NULL);
-
-      // set DWMWA_USE_IMMERSIVE_DARK_MODE; needed for titlebar
-      BOOL dark = 1;
-      if (S_OK != pDwmSetWindowAttribute(w, 20, &dark, sizeof dark)) {
-        // this would be the call before Windows build 18362
-        pDwmSetWindowAttribute(w, 19, &dark, sizeof dark);
-      }
-    }
   }
 }
 
@@ -1716,50 +1692,19 @@ flash_border()
  * Bell.
  */
 void
-do_win_bell(config * conf, bool margin_bell)
+win_bell(config * conf)
 {
   do_update();
 
-  term_bell * bellstate = margin_bell ? &term.marginbell : &term.bell;
-  unsigned long now = mtime();
+  static unsigned long last_bell = 0;
+         unsigned long now = mtime();
 
-  if (conf->bell_type &&
-      (now - bellstate->last_bell >= (unsigned long)conf->bell_interval
-       || bellstate->vol != bellstate->last_vol
-      )
-     )
-  {
-    bellstate->last_bell = now;
-    bellstate->last_vol = bellstate->vol;
-
-    wchar * bell_name = 0;
-    void set_bells(char * belli)
-    {
-      while (*belli) {
-        int i = (*belli & 0x0F) - 2;
-        if (i >= 0 && i < (int)lengthof(conf->bell_file))
-          bell_name = (wchar *)conf->bell_file[i];
-        if (bell_name && *bell_name) {
-          return;
-        }
-        belli++;
-      }
-    }
-    switch (bellstate->vol) {
-      // no bell volume: 0 1
-      // low bell volume: 2 3 4
-      // high bell volume: 5 6 7 8
-      when 8: set_bells("8765432");
-      when 7: set_bells("7658432");
-      when 6: set_bells("6758432");
-      when 5: set_bells("5678432");
-      when 4: set_bells("4325678");
-      when 3: set_bells("3425678");
-      when 2: set_bells("2345678");
-    }
-
+  if ( (conf->bell_sound || conf->bell_type) &&
+      ((unsigned long)conf->bell_interval <= now - last_bell) ) {
+    wchar * bell_name = (wchar *)conf->bell_file;
     bool free_bell_name = false;
-    if (bell_name && *bell_name) {
+    last_bell = now;
+    if (*bell_name) {
       if (wcschr(bell_name, L'/') || wcschr(bell_name, L'\\')) {
         if (bell_name[1] != ':') {
           char * bf = path_win_w_to_posix(bell_name);
@@ -1794,9 +1739,6 @@ do_win_bell(config * conf, bool margin_bell)
     if (bell_name && *bell_name && PlaySoundW(bell_name, NULL, SND_ASYNC | SND_FILENAME)) {
       // played
     }
-    else if (bellstate->vol <= 1) {
-      // muted
-    }
     else if (conf->bell_freq)
       Beep(conf->bell_freq, conf->bell_len);
     else if (conf->bell_type > 0) {
@@ -1821,19 +1763,6 @@ do_win_bell(config * conf, bool margin_bell)
   if (term.bell_popup)
     win_set_zorder(true);
 }
-
-void
-win_bell(config * conf)
-{
-  do_win_bell(conf, false);
-}
-
-void
-win_margin_bell(config * conf)
-{
-  do_win_bell(conf, true);
-}
-
 
 void
 win_invalidate_all(bool clearbg)
@@ -2457,26 +2386,6 @@ show_iconwarn(wchar * winmsg)
 #define dont_debug_only_sizepos_messages
 #define dont_debug_mouse_messages
 
-static LPARAM
-screentoclient(HWND wnd, LPARAM lp)
-{
-  POINT wpos = {.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
-  ScreenToClient(wnd, &wpos);
-  return MAKELPARAM(wpos.x, wpos.y);
-}
-
-static bool
-in_client_area(HWND wnd, LPARAM lp)
-{
-  POINT wpos = {.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
-  ScreenToClient(wnd, &wpos);
-  int height, width;
-  win_get_pixels(&height, &width, false);
-  height += 2 * PADDING;
-  width += 2 * PADDING;
-  return wpos.y >= 0 && wpos.y < height && wpos.x >= 0 && wpos.x < width;
-}
-
 static LRESULT CALLBACK
 win_proc(HWND wnd, UINT message, WPARAM wp, LPARAM lp)
 {
@@ -2824,7 +2733,7 @@ static struct {
     }
 
     when WM_MOUSEMOVE: win_mouse_move(false, lp);
-    when WM_NCMOUSEMOVE: win_mouse_move(true, screentoclient(wnd, lp));
+    when WM_NCMOUSEMOVE: win_mouse_move(true, lp);
     when WM_LBUTTONDOWN: win_mouse_click(MBT_LEFT, lp);
     when WM_RBUTTONDOWN: win_mouse_click(MBT_RIGHT, lp);
     when WM_MBUTTONDOWN: win_mouse_click(MBT_MIDDLE, lp);
@@ -2841,66 +2750,16 @@ static struct {
         when XBUTTON1: win_mouse_release(MBT_4, lp);
         when XBUTTON2: win_mouse_release(MBT_5, lp);
       }
-    when WM_NCLBUTTONDOWN or WM_NCLBUTTONDBLCLK:
-      if (in_client_area(wnd, lp)) {
-        // clicked within "client area";
-        // Windows sends the NC message nonetheless when Ctrl+Alt is held
-        win_mouse_click(MBT_LEFT, screentoclient(wnd, lp));
-        return 0;
-      }
-      else
-      if (wp == HTCAPTION && get_mods() == MDK_CTRL) {
+    when WM_NCLBUTTONDOWN:
+      if (wp == HTCAPTION && (GetKeyState(VK_CONTROL) & 0x80)) {
         if (win_title_menu(true))
           return 0;
       }
-    when WM_NCRBUTTONDOWN or WM_NCRBUTTONDBLCLK:
-      if (in_client_area(wnd, lp)) {
-        // clicked within "client area";
-        // Windows sends the NC message nonetheless when Ctrl+Alt is held
-        win_mouse_click(MBT_RIGHT, screentoclient(wnd, lp));
-        return 0;
-      }
-      else
-      if (wp == HTCAPTION && (cfg.geom_sync > 0 || get_mods() == MDK_CTRL)) {
+    when WM_NCRBUTTONDOWN:
+      if (wp == HTCAPTION && (cfg.geom_sync > 0 || (GetKeyState(VK_CONTROL) & 0x80))) {
         if (win_title_menu(false))
           return 0;
       }
-    when WM_NCMBUTTONDOWN or WM_NCMBUTTONDBLCLK:
-      if (in_client_area(wnd, lp)) {
-        win_mouse_click(MBT_MIDDLE, screentoclient(wnd, lp));
-        return 0;
-      }
-    when WM_NCXBUTTONDOWN or WM_NCXBUTTONDBLCLK:
-      if (in_client_area(wnd, lp))
-        switch (HIWORD(wp)) {
-          when XBUTTON1: win_mouse_click(MBT_4, screentoclient(wnd, lp));
-                         return 0;
-          when XBUTTON2: win_mouse_click(MBT_5, screentoclient(wnd, lp));
-                         return 0;
-        }
-    when WM_NCLBUTTONUP:
-      if (in_client_area(wnd, lp)) {
-        win_mouse_release(MBT_LEFT, screentoclient(wnd, lp));
-        return 0;
-      }
-    when WM_NCRBUTTONUP:
-      if (in_client_area(wnd, lp)) {
-        win_mouse_release(MBT_RIGHT, screentoclient(wnd, lp));
-        return 0;
-      }
-    when WM_NCMBUTTONUP:
-      if (in_client_area(wnd, lp)) {
-        win_mouse_release(MBT_MIDDLE, screentoclient(wnd, lp));
-        return 0;
-      }
-    when WM_NCXBUTTONUP:
-      if (in_client_area(wnd, lp))
-        switch (HIWORD(wp)) {
-          when XBUTTON1: win_mouse_release(MBT_4, screentoclient(wnd, lp));
-                         return 0;
-          when XBUTTON2: win_mouse_release(MBT_5, screentoclient(wnd, lp));
-                         return 0;
-        }
 
     when WM_KEYDOWN or WM_SYSKEYDOWN:
       //printf("[%ld] WM_KEY %02X\n", mtime(), (int)wp);
@@ -2912,28 +2771,12 @@ static struct {
         return 0;
 
     when WM_CHAR or WM_SYSCHAR:
-      provide_input(wp);
       child_sendw(&(wchar){wp}, 1);
       return 0;
-
-    when WM_UNICHAR:
-      if (wp == UNICODE_NOCHAR)
-        return true;
-      else if (wp > 0xFFFF) {
-        provide_input(0xFFFF);
-        child_sendw((wchar[]){high_surrogate(wp), low_surrogate(wp)}, 2);
-        return false;
-      }
-      else {
-        provide_input(wp);
-        child_sendw(&(wchar){wp}, 1);
-        return false;
-      }
 
     when WM_MENUCHAR:
       // this is sent after leaving the system menu with ESC 
       // and typing a key; insert the key and prevent the beep
-      provide_input(wp);
       child_sendw(&(wchar){wp}, 1);
       return MNC_CLOSE << 16;
 
@@ -2979,7 +2822,6 @@ static struct {
         if (len > 0) {
           char buf[len];
           ImmGetCompositionStringW(imc, GCS_RESULTSTR, buf, len);
-          provide_input(*(wchar *)buf);
           child_sendw((wchar *)buf, len / 2);
         }
         return 1;
@@ -4689,11 +4531,6 @@ main(int argc, char *argv[])
     monitor = atoi(getenv("MINTTY_MONITOR"));
     unsetenv("MINTTY_MONITOR");
   }
-  int run_max = 0;
-  if (getenv("MINTTY_MAXIMIZE")) {
-    run_max = atoi(getenv("MINTTY_MAXIMIZE"));
-    unsetenv("MINTTY_MAXIMIZE");
-  }
 
   // if started from console, try to detach from caller's terminal (~daemonizing)
   // in order to not suppress signals
@@ -5049,11 +4886,6 @@ main(int argc, char *argv[])
 #define printpos(tag, x, y, mon)
 #endif
 
-  // Dark mode support, prior to window creation
-  if (pSetPreferredAppMode) {
-    pSetPreferredAppMode(1); /* AllowDark */
-  }
-
   // Create initial window.
   term.show_scrollbar = cfg.scrollbar;  // hotfix #597
   wnd = CreateWindowExW(cfg.scrollbar < 0 ? WS_EX_LEFTSCROLLBAR : 0,
@@ -5064,7 +4896,24 @@ main(int argc, char *argv[])
   trace_winsize("createwindow");
 
   // Dark mode support
-  win_dark_mode(wnd);
+  if (pShouldAppsUseDarkMode) {
+    HIGHCONTRASTW hc;
+    hc.cbSize = sizeof hc;
+    pSystemParametersInfo(SPI_GETHIGHCONTRAST, sizeof hc, &hc, 0);
+    //printf("High Contrast scheme <%ls>\n", hc.lpszDefaultScheme);
+
+    if (!(hc.dwFlags & HCF_HIGHCONTRASTON) && pShouldAppsUseDarkMode()) {
+      pSetWindowTheme(wnd, W("DarkMode_Explorer"), NULL);
+      BOOL dark = 1;
+
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 19
+#endif
+
+      pDwmSetWindowAttribute(wnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                             &dark, sizeof dark);
+    }
+  }
 
   // Workaround for failing title parameter:
   if (pEnableNonClientDpiScaling)
@@ -5311,9 +5160,8 @@ main(int argc, char *argv[])
   // Determine how to show the window.
   go_fullscr_on_max = (cfg.window == -1);
   default_size_token = true;  // prevent font zooming (#708)
-  int show_cmd = (go_fullscr_on_max || run_max) ? SW_SHOWMAXIMIZED : cfg.window;
+  int show_cmd = go_fullscr_on_max ? SW_SHOWMAXIMIZED : cfg.window;
   show_cmd = win_fix_taskbar_max(show_cmd);
-  // if (run_max == 2) win_maximise(2); // do that later to reduce flickering
 
   // Scale to background image aspect ratio if requested
   win_get_pixels(&ini_height, &ini_width, false);
@@ -5328,17 +5176,12 @@ main(int argc, char *argv[])
   // Finally show the window.
   ShowWindow(wnd, show_cmd);
   SetFocus(wnd);
-  // Cloning fullscreen window
-  if (run_max == 2)
-    win_maximise(2);
 
   // Set up clipboard notifications.
   HRESULT (WINAPI * pAddClipboardFormatListener)(HWND) =
     load_library_func("user32.dll", "AddClipboardFormatListener");
   if (pAddClipboardFormatListener) {
-    if (cfg.external_hotkeys < 4)
-      // send WM_CLIPBOARDUPDATE
-      pAddClipboardFormatListener(wnd);
+    pAddClipboardFormatListener(wnd);
   }
 
   win_synctabs(4);
